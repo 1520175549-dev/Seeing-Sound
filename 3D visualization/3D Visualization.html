@@ -1,0 +1,516 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Quest 3 MR HUD - Real 3D Vehicle Warning</title>
+    <style>
+        body { margin: 0; overflow: hidden; background-color: #050505; color: white; font-family: sans-serif; }
+        #info { position: absolute; top: 15px; width: 100%; text-align: center; pointer-events: none; z-index: 10; text-shadow: 1px 1px 2px black;}
+        
+        #controls {
+            position: absolute; bottom: 30px; left: 20px; display: flex; flex-direction: column; gap: 8px;
+            z-index: 20; background: rgba(10, 10, 10, 0.85); padding: 12px; border-radius: 8px; border: 1px solid #444;
+            box-shadow: 0 4px 15px rgba(0,0,0,0.8); min-width: 340px;
+        }
+        .custom-btn {
+            display: inline-block; background-color: #0078D7; color: white; padding: 10px 15px; font-size: 14px; 
+            font-weight: bold; border-radius: 5px; cursor: pointer; text-align: center; transition: background-color 0.3s; 
+            border: 1px solid #005A9E; margin-bottom: 5px;
+        }
+        .custom-btn:hover { background-color: #005A9E; }
+        .transform-btn { background-color: #107C10; border-color: #0B5A0B; }
+        .transform-btn:hover { background-color: #0B5A0B; }
+        
+        #alert-log { background: #1a1a1a; padding: 10px; border-radius: 5px; border: 1px solid #333; font-size: 13px; color: #fff; max-height: 100px; overflow-y: hidden; word-break: break-all; }
+        .log-item { margin-bottom: 4px; border-bottom: 1px solid #333; padding-bottom: 2px; }
+        
+        #ws-status { font-size: 12px; color: #ffaa00; text-align: center; margin-top: 5px;}
+        #loading-ui { font-size: 12px; color: #00ffaa; text-align: center; margin-top: 5px;}
+        
+        .slider-container { display: flex; flex-direction: column; gap: 5px; background: #222; padding: 10px; border-radius: 5px; border: 1px solid #444;}
+        .slider-label { font-size: 13px; color: #ccc; }
+        input[type=range] { width: 100%; cursor: pointer; }
+    </style>
+    <script type="importmap">
+    {
+        "imports": {
+            "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+            "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+        }
+    }
+    </script>
+</head>
+<body>
+    <div id="info">
+        <h2>👁️ Real 3D Approaching Vehicle Warning (Quest 3 MR)</h2>
+        <p>📡 Live AI Edge Inference Mode | 🖱️ Scale Spectrogram</p>
+    </div>
+
+    <div id="controls">
+        <div class="slider-container">
+            <div class="slider-label">🔍 Spectrogram Scale: <span id="scale-value">0.3x</span></div>
+            <input type="range" id="scale-slider" min="0.1" max="2.0" step="0.1" value="0.3">
+        </div>
+
+        <div class="custom-btn transform-btn" id="btn-transform-mode">🔄 Transform Mode: Move</div>
+        
+        <div id="alert-log">Waiting for AI alerts...</div>
+        <div id="ws-status">WebSocket: Disconnected</div>
+        <div id="loading-ui">📦 Loading 3D models...</div>
+    </div>
+
+<script type="module">
+    import * as THREE from 'three';
+    import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
+    import { TransformControls } from 'three/addons/controls/TransformControls.js';
+    import { ARButton } from 'three/addons/webxr/ARButton.js';
+    import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
+
+    const EYE_HEIGHT = 1.6; 
+    const PANEL_SIZE = 1.8; 
+    const MAX_PEAK = 0.8;   
+    
+    const FREQ_BINS = 64; 
+    const TIME_STEPS = 100;
+    const ALERT_DURATION = 5000; 
+
+    let latestFFTData = new Array(FREQ_BINS).fill(0);
+    let targetFFTData = new Array(FREQ_BINS).fill(0);
+    const SMOOTHING = 0.20; 
+
+    // --- 1. Scene Setup ---
+    const scene = new THREE.Scene();
+    const camera = new THREE.PerspectiveCamera(60, window.innerWidth / window.innerHeight, 0.1, 500);
+    camera.position.set(0, EYE_HEIGHT, 0); 
+    
+    const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: true });
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.xr.enabled = true; 
+    renderer.outputColorSpace = THREE.SRGBColorSpace;
+    document.body.appendChild(renderer.domElement);
+    document.body.appendChild(ARButton.createButton(renderer));
+    
+    const controls = new OrbitControls(camera, renderer.domElement);
+    controls.target.set(0, EYE_HEIGHT, -1); controls.enablePan = false; controls.enableZoom = false; controls.update();
+    
+    const transformControls = new TransformControls(camera, renderer.domElement);
+    scene.add(transformControls);
+    transformControls.addEventListener('dragging-changed', (e) => { controls.enabled = !e.value; });
+
+    const btnTransformMode = document.getElementById('btn-transform-mode');
+    const modes = ['translate', 'rotate', 'scale']; 
+    const modeNames = ['Move', 'Rotate', 'Scale'];
+    let currentModeIdx = 0;
+    btnTransformMode.addEventListener('click', () => {
+        currentModeIdx = (currentModeIdx + 1) % modes.length;
+        transformControls.setMode(modes[currentModeIdx]);
+        btnTransformMode.innerText = `🔄 Transform Mode: ${modeNames[currentModeIdx]}`;
+    });
+
+    scene.add(new THREE.AmbientLight(0xffffff, 1.2));
+    const dirLight = new THREE.DirectionalLight(0xffffff, 2.0);
+    dirLight.position.set(10, 20, 10);
+    scene.add(dirLight);
+
+    // 💡 --- [Addition 1: Create a true 3D head-locked HUD sprite] ---
+    const hudCanvas = document.createElement('canvas');
+    hudCanvas.width = 1024;
+    hudCanvas.height = 256;
+    const hudCtx = hudCanvas.getContext('2d');
+
+    const hudTexture = new THREE.CanvasTexture(hudCanvas);
+    const hudMaterial = new THREE.SpriteMaterial({ map: hudTexture, transparent: true, depthTest: false });
+    const screenHudSprite = new THREE.Sprite(hudMaterial);
+    
+    // Set initial HUD size, hidden by default
+    screenHudSprite.scale.set(0.8, 0.2, 1); 
+    screenHudSprite.visible = false;
+    scene.add(screenHudSprite);
+
+    let hudActiveUntil = 0;
+
+    // Method to dynamically redraw the 3D material canvas
+    function updateHudTexture(alertType, directionText, distanceText) {
+        hudCtx.clearRect(0, 0, hudCanvas.width, hudCanvas.height);
+
+        // Draw semi-transparent warning background board
+        hudCtx.fillStyle = 'rgba(20, 0, 0, 0.85)';
+        hudCtx.lineWidth = 6;
+        hudCtx.strokeStyle = '#ff3333';
+        
+        // Draw rounded rectangle background board
+        hudCtx.beginPath();
+        hudCtx.roundRect(10, 10, hudCanvas.width - 20, hudCanvas.height - 20, 24);
+        hudCtx.fill();
+        hudCtx.stroke();
+
+        // Draw first line large title: WARNING
+        hudCtx.font = 'bold 44px Arial';
+        hudCtx.fillStyle = '#ff3333';
+        hudCtx.textAlign = 'center';
+        hudCtx.shadowColor = 'rgba(255, 0, 0, 0.5)';
+        hudCtx.shadowBlur = 10;
+        hudCtx.fillText('⚠️ INBOUND VEHICLE DETECTED', hudCanvas.width / 2, 75);
+
+        // Draw second line content: Alert details
+        hudCtx.shadowBlur = 0; // Disable shadow to prevent text blurring
+        hudCtx.font = 'bold 36px Arial';
+        hudCtx.fillStyle = '#ffffff';
+        hudCtx.fillText(`${alertType} from `, hudCanvas.width / 2 - 120, 175);
+        
+        // Highlight and emphasize direction text
+        hudCtx.fillStyle = '#00ffaa';
+        hudCtx.fillText(directionText, hudCanvas.width / 2 + 160, 175);
+
+        // Add distance
+        hudCtx.fillStyle = '#ffaa00';
+        hudCtx.font = '32px Arial';
+        hudCtx.fillText(`[Range: ${distanceText}]`, hudCanvas.width / 2, 230);
+
+        hudTexture.needsUpdate = true;
+    }
+
+    // --- 2. Load External Models ---
+    let realCarTemplate = null; let realPoliceCarTemplate = null;
+    const gltfLoader = new GLTFLoader();
+    const loadingUI = document.getElementById('loading-ui');
+
+    gltfLoader.load('car.glb', (gltf) => {
+        realCarTemplate = gltf.scene;
+        const box = new THREE.Box3().setFromObject(realCarTemplate);
+        const scaleRatio = 1.8 / box.getSize(new THREE.Vector3()).z; 
+        realCarTemplate.scale.set(scaleRatio, scaleRatio, scaleRatio);
+        box.setFromObject(realCarTemplate);
+        realCarTemplate.position.sub(box.getCenter(new THREE.Vector3())); 
+        realCarTemplate.position.y += box.getSize(new THREE.Vector3()).y / 2;
+    }, undefined, () => {
+        realCarTemplate = new THREE.Group();
+        const fallback = new THREE.Mesh(new THREE.BoxGeometry(0.8, 0.4, 1.8), new THREE.MeshBasicMaterial({ color: 0x4488ff, wireframe: true }));
+        fallback.position.y = 0.2; realCarTemplate.add(fallback);
+    });
+
+    gltfLoader.load('police_car.glb', (gltf) => {
+        realPoliceCarTemplate = gltf.scene;
+        const box = new THREE.Box3().setFromObject(realPoliceCarTemplate);
+        const scaleRatio = 1.8 / box.getSize(new THREE.Vector3()).z; 
+        realPoliceCarTemplate.scale.set(scaleRatio, scaleRatio, scaleRatio);
+        box.setFromObject(realPoliceCarTemplate);
+        realPoliceCarTemplate.position.sub(box.getCenter(new THREE.Vector3())); 
+        realPoliceCarTemplate.position.y += box.getSize(new THREE.Vector3()).y / 2;
+        loadingUI.innerText = "✅ Dual Models loaded ready.";
+    }, undefined, () => {
+        realPoliceCarTemplate = new THREE.Group();
+        const fallback = new THREE.Mesh(new THREE.BoxGeometry(0.8, 0.5, 1.8), new THREE.MeshBasicMaterial({ color: 0xff0000, wireframe: true }));
+        fallback.position.y = 0.25; realPoliceCarTemplate.add(fallback);
+    });
+
+    // --- 3. Spectrogram Mesh Setup ---
+    const spectrumGroup = new THREE.Group();
+    scene.add(spectrumGroup);
+
+    spectrumGroup.position.set(-0.3, 0.2, -1.3); 
+    spectrumGroup.rotation.set(0.4, 0.2, 0); 
+    spectrumGroup.scale.set(0.3, 0.3, 0.3); 
+    transformControls.attach(spectrumGroup);
+
+    const spectrumGeometry = new THREE.PlaneGeometry(PANEL_SIZE, PANEL_SIZE, FREQ_BINS - 1, TIME_STEPS - 1);
+    spectrumGeometry.rotateX(-Math.PI / 2); 
+    spectrumGeometry.setAttribute('color', new THREE.BufferAttribute(new Float32Array(spectrumGeometry.attributes.position.count * 3), 3));
+    const spectrumMesh = new THREE.Mesh(spectrumGeometry, new THREE.MeshBasicMaterial({ vertexColors: true, side: THREE.DoubleSide, transparent: true, opacity: 0.9 }));
+    spectrumGroup.add(spectrumMesh); 
+
+    function addDetailedAxes(group) {
+        const originX = -PANEL_SIZE / 2; const originZ = PANEL_SIZE / 2;
+        const axisMat = new THREE.LineBasicMaterial({ color: 0x888888 });
+        const points = [
+            new THREE.Vector3(originX, 0, originZ), new THREE.Vector3(PANEL_SIZE / 2, 0, originZ), 
+            new THREE.Vector3(originX, 0, originZ), new THREE.Vector3(originX, 0, -PANEL_SIZE / 2), 
+            new THREE.Vector3(originX, 0, originZ), new THREE.Vector3(originX, MAX_PEAK, originZ)   
+        ];
+        group.add(new THREE.LineSegments(new THREE.BufferGeometry().setFromPoints(points), axisMat));
+
+        function createTextLabel(text, position, color = '#0f0', size = 32) {
+            const canvas = document.createElement('canvas'); canvas.width = 512; canvas.height = 128;
+            const ctx = canvas.getContext('2d'); ctx.font = `bold ${size}px Arial`; ctx.textAlign = 'center'; ctx.textBaseline = 'middle'; ctx.fillStyle = color; ctx.fillText(text, 256, 64);
+            const sprite = new THREE.Sprite(new THREE.SpriteMaterial({ map: new THREE.CanvasTexture(canvas), transparent: true }));
+            sprite.position.copy(position); 
+            sprite.scale.set(PANEL_SIZE * 0.4, PANEL_SIZE * 0.1, 1); 
+            group.add(sprite);
+        }
+
+        const offset = PANEL_SIZE * 0.08;
+
+        createTextLabel("0 Hz", new THREE.Vector3(originX, -offset, originZ + offset), '#00ffaa');
+        createTextLabel("1500 Hz", new THREE.Vector3(0, -offset, originZ + offset), '#00ffaa');
+        createTextLabel("3000 Hz", new THREE.Vector3(PANEL_SIZE / 2, -offset, originZ + offset), '#00ffaa');
+        createTextLabel("Frequency", new THREE.Vector3(0, -offset * 2.5, originZ + offset * 2.5), '#fff', 36);
+
+        createTextLabel("-100 dB", new THREE.Vector3(originX - offset * 2.5, 0, originZ), '#ffaa00');
+        createTextLabel("-50 dB", new THREE.Vector3(originX - offset * 2.5, MAX_PEAK / 2, originZ), '#ffaa00');
+        createTextLabel("0 dB", new THREE.Vector3(originX - offset * 2.5, MAX_PEAK, originZ), '#ffaa00');
+        createTextLabel("Intensity", new THREE.Vector3(originX - offset * 2.5, MAX_PEAK + offset * 1.5, originZ), '#fff', 36);
+    }
+    addDetailedAxes(spectrumGroup);
+
+    document.getElementById('scale-slider').addEventListener('input', (e) => {
+        const val = parseFloat(e.target.value);
+        document.getElementById('scale-value').innerText = `${val.toFixed(1)}x`;
+        spectrumGroup.scale.set(val, val, val);
+    });
+
+    // --- 4. WebXR Session & Controller Interaction ---
+    const xrController = renderer.xr.getController(0); 
+    scene.add(xrController);
+
+    const rayGeometry = new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(0, 0, 0), new THREE.Vector3(0, 0, -5)]);
+    const rayMaterial = new THREE.LineBasicMaterial({ color: 0x00ffaa, transparent: true, opacity: 0.5 });
+    const rayLine = new THREE.Line(rayGeometry, rayMaterial);
+    xrController.add(rayLine);
+
+    renderer.xr.addEventListener('sessionstart', () => {
+        transformControls.detach(); 
+        spectrumGroup.position.set(-0.3, -0.4, -1.1);
+        spectrumGroup.rotation.set(0.4, 0.2, 0); 
+        spectrumGroup.scale.set(0.3, 0.3, 0.3);
+    });
+
+    renderer.xr.addEventListener('sessionend', () => {
+        transformControls.attach(spectrumGroup); 
+        spectrumGroup.position.set(-0.3, 0.2, -1.3);
+        spectrumGroup.rotation.set(0.4, 0.2, 0);
+        spectrumGroup.scale.set(0.3, 0.3, 0.3);
+    });
+
+    xrController.addEventListener('selectstart', () => {
+        xrController.attach(spectrumGroup); 
+        rayLine.material.color.setHex(0xff0000); 
+    });
+
+    xrController.addEventListener('selectend', () => {
+        scene.attach(spectrumGroup); 
+        rayLine.material.color.setHex(0x00ffaa); 
+    });
+
+
+    // --- 5. Vehicles & Alert Logic ---
+    function create3DHorn(dangerColorHex) {
+        const hornGroup = new THREE.Group();
+        const cone = new THREE.Mesh(new THREE.CylinderGeometry(0.3, 0.08, 0.6, 32).rotateX(Math.PI / 2), new THREE.MeshStandardMaterial({ color: 0x333333, metalness: 0.8, roughness: 0.2 }));
+        hornGroup.add(cone);
+        const base = new THREE.Mesh(new THREE.CylinderGeometry(0.12, 0.12, 0.25, 32).rotateX(Math.PI / 2), new THREE.MeshStandardMaterial({ color: 0x111111, roughness: 0.8 }));
+        base.position.set(0, 0, -0.4); hornGroup.add(base);
+        const inner = new THREE.Mesh(new THREE.CircleGeometry(0.25, 32), new THREE.MeshBasicMaterial({ color: dangerColorHex, side: THREE.DoubleSide }));
+        inner.position.set(0, 0, 0.25); hornGroup.add(inner);
+        const waveGroup = new THREE.Group(); waveGroup.name = "waveGroup"; 
+        for(let i=0; i<3; i++) waveGroup.add(new THREE.Mesh(new THREE.TorusGeometry(0.25, 0.04, 16, 32), new THREE.MeshBasicMaterial({ color: dangerColorHex, transparent: true, opacity: 0.8 })));
+        hornGroup.add(waveGroup);
+        return hornGroup;
+    }
+
+    function create3DCarGroup(dangerColorHex, alertType) {
+        const group = new THREE.Group();
+        if (alertType === 'SIREN' && realPoliceCarTemplate) group.add(realPoliceCarTemplate.clone());
+        else if (realCarTemplate) group.add(realCarTemplate.clone());
+
+        const ring = new THREE.Mesh(new THREE.RingGeometry(1.2, 1.5, 32), new THREE.MeshBasicMaterial({ color: dangerColorHex, side: THREE.DoubleSide, transparent: true, opacity: 0.8 }));
+        ring.rotation.x = -Math.PI / 2; ring.position.y = 0.05; group.add(ring);
+        
+        const horn3D = create3DHorn(dangerColorHex); 
+        horn3D.name = "honkIcon"; 
+        horn3D.position.set(0, 0.4, 2.0); 
+        horn3D.scale.set(0.3, 0.3, 0.3); 
+        group.add(horn3D);
+        return group;
+    }
+
+    const activeAlerts = [];
+    const logPanel = document.getElementById('alert-log');
+
+    // Convert radians to absolute English direction orientation
+    function getDirectionText(angleRad) {
+        let deg = (angleRad * 180 / Math.PI) % 360;
+        if (deg < 0) deg += 360;
+
+        if (deg >= 315 || deg < 45) return `Forward [${deg.toFixed(0)}°]`;
+        if (deg >= 45 && deg < 135) return `Right [${deg.toFixed(0)}°]`;
+        if (deg >= 135 && deg < 225) return `Backward [${deg.toFixed(0)}°]`;
+        return `Left [${deg.toFixed(0)}°]`;
+    }
+
+    function triggerUrbanAlert(data) {
+        const alertType = data.type || "HONK";
+        const angleDeg = (data.angle * 180 / Math.PI).toFixed(1);
+        logPanel.innerHTML = `<div class="log-item">[${new Date().toLocaleTimeString()}] 🚨 ${alertType} Detected<br><span style="color:#0f0;font-size:11px">↳ Angle: ${angleDeg}° | Dist: ${data.distance}</span></div>` + logPanel.innerHTML;
+
+        let dangerColorHex, startRadius;
+        if (data.distance === 'Near') { dangerColorHex = 0xff0000; startRadius = 3.5; }
+        else if (data.distance === 'Medium') { dangerColorHex = 0xffa500; startRadius = 6.0; }
+        else { dangerColorHex = 0x00ff00; startRadius = 9.0; }
+
+        const angle = data.angle || 0;
+        const startX = Math.sin(angle) * startRadius;
+        const startZ = -Math.cos(angle) * startRadius;
+        
+        const carGroup = create3DCarGroup(dangerColorHex, alertType);
+        carGroup.position.set(startX, 0, startZ); 
+        carGroup.lookAt(0, 0, 0); 
+        scene.add(carGroup);
+        
+        activeAlerts.push({
+            alertData: { mesh: carGroup, startPos: new THREE.Vector3(startX, 0, startZ), endPos: new THREE.Vector3(startX * 0.3, 0, startZ * 0.3) },
+            timestamp: performance.now()
+        });
+
+        // 💡 --- [Addition 2: Dynamically refresh 3D HUD Canvas text and illuminate when alert is triggered] ---
+        const dirText = getDirectionText(angle);
+        updateHudTexture(alertType, dirText, data.distance);
+        
+        screenHudSprite.visible = true;
+        hudActiveUntil = performance.now() + ALERT_DURATION;
+    }
+
+    // --- 6. WebSocket Connection ---
+    let ws;
+    const wsStatusUI = document.getElementById('ws-status');
+    function connectWebSocket() {
+        ws = new WebSocket('ws://172.20.10.5:8765');
+        
+        ws.onopen = () => { 
+            wsStatusUI.innerText = "WebSocket: Connected 🟢 (Live Inference)"; 
+            wsStatusUI.style.color = "#0f0"; 
+        };
+        
+        ws.onmessage = (event) => {
+            try { 
+                const msg = JSON.parse(event.data); 
+                if (msg.msg_type === "FFT_STREAM") {
+                    targetFFTData = msg.data;
+                } else if (msg.msg_type === "ALERT") {
+                    triggerUrbanAlert(msg);
+                }
+            } 
+            catch(e) { console.error("Data parse error", e); }
+        };
+        
+        ws.onclose = () => { 
+            wsStatusUI.innerText = "WebSocket: Disconnected 🔴"; 
+            wsStatusUI.style.color = "#f00"; 
+            setTimeout(connectWebSocket, 3000); 
+        };
+    }
+    connectWebSocket();
+
+    // --- 7. Main Animation Loop ---
+    const heatColors = [ 
+        [5, 5, 25],      
+        [120, 10, 130],  
+        [240, 40, 10],   
+        [255, 130, 0],   
+        [255, 220, 50],  
+        [255, 255, 255]  
+    ];
+    let frameCounter = 0;
+
+    // Create reusable vectors to avoid memory allocation inside the loop
+    const cameraDirection = new THREE.Vector3();
+
+    function animate() {
+        if (!renderer.xr.isPresenting) controls.update();
+        const currentTime = performance.now();
+        frameCounter++;
+
+        // 💡 --- [Addition 3: Force the 3D HUD to always lock 1.2 meters directly in front of the player's view] ---
+        if (screenHudSprite.visible) {
+            if (currentTime > hudActiveUntil) {
+                screenHudSprite.visible = false;
+            } else {
+                // Get the current line-of-sight direction vector of the headset/camera
+                camera.getWorldDirection(cameraDirection);
+                
+                // Calculate the 3D coordinates 1.2 meters in front of the headset and bind to the HUD sprite
+                screenHudSprite.position.copy(camera.position).addScaledVector(cameraDirection, 1.2);
+                
+                // Set the vertical offset: 0.0 is dead center. Negative values move it lower like a dashboard.
+                screenHudSprite.position.y += 0.0; 
+                
+                // Breathing/flashing animation effect (dynamically change opacity)
+                hudMaterial.opacity = 0.8 + Math.sin(currentTime * 0.01) * 0.15;
+            }
+        }
+        
+        for (let x = 0; x < FREQ_BINS; x++) {
+            const targetVal = targetFFTData[x] || 0;
+            latestFFTData[x] = latestFFTData[x] * (1 - SMOOTHING) + targetVal * SMOOTHING;
+        }
+
+        for (let i = activeAlerts.length - 1; i >= 0; i--) {
+            const alert = activeAlerts[i];
+            const age = currentTime - alert.timestamp;
+            const carGroup = alert.alertData.mesh;
+
+            if (age > ALERT_DURATION) { scene.remove(carGroup); activeAlerts.splice(i, 1); continue; }
+
+            const animationT = Math.min(age / ALERT_DURATION, 1.0);
+            carGroup.position.lerpVectors(alert.alertData.startPos, alert.alertData.endPos, animationT);
+            
+            const scaleFactor = Math.max(0.3, carGroup.position.distanceTo(new THREE.Vector3(0, 0, 0)) / 10);
+            carGroup.scale.set(scaleFactor, scaleFactor, scaleFactor);
+
+            const horn = carGroup.getObjectByName("honkIcon");
+            if (horn) {
+                const pulseScale = 0.3 + Math.sin(currentTime * 0.05) * 0.015;
+                horn.scale.set(pulseScale, pulseScale, pulseScale);
+                const waves = horn.getObjectByName("waveGroup"); 
+                if (waves) {
+                    waves.children.forEach((ring, index) => {
+                        let progress = ((currentTime * 0.0015) + index * 0.33) % 1.0;
+                        const ringScale = 1.0 + progress * 1.5; ring.scale.set(ringScale, ringScale, 1);
+                        ring.position.z = 0.25 + (progress * 1.0); ring.material.opacity = 1.0 - progress; 
+                    });
+                }
+            }
+            if (age > ALERT_DURATION - 1000) {
+                const opacity = 1.0 - ((age - (ALERT_DURATION - 1000)) / 1000);
+                carGroup.children.forEach(child => {
+                    if (child.isMesh && child.geometry.type === 'RingGeometry') child.material.opacity = opacity * 0.8; 
+                    else if (child.isGroup || child.isMesh) carGroup.scale.multiplyScalar(opacity);
+                });
+            }
+        }
+
+        const positions = spectrumGeometry.attributes.position.array;
+        const colorsArr = spectrumGeometry.attributes.color.array;
+
+        if (frameCounter % 2 === 0) {
+            for (let z = TIME_STEPS - 1; z > 0; z--) {
+                for (let x = 0; x < FREQ_BINS; x++) {
+                    const curr = z * FREQ_BINS + x, prev = (z - 1) * FREQ_BINS + x;
+                    positions[curr * 3 + 1] = positions[prev * 3 + 1];
+                    colorsArr[curr * 3] = colorsArr[prev * 3];
+                    colorsArr[curr * 3 + 1] = colorsArr[prev * 3 + 1];
+                    colorsArr[curr * 3 + 2] = colorsArr[prev * 3 + 2];
+                }
+            }
+        }
+        
+        for (let x = 0; x < FREQ_BINS; x++) {
+            const intensity = latestFFTData[x] || 0; 
+            positions[x * 3 + 1] = (intensity / 255.0) * MAX_PEAK; 
+            
+            const normalized = intensity / 255.0;
+            let cIdx = Math.floor(normalized * 5), nextIdx = Math.min(cIdx + 1, 5), frac = (normalized * 5) - cIdx;
+            colorsArr[x * 3] = (heatColors[cIdx][0] + frac * (heatColors[nextIdx][0] - heatColors[cIdx][0])) / 255.0; 
+            colorsArr[x * 3 + 1] = (heatColors[cIdx][1] + frac * (heatColors[nextIdx][1] - heatColors[cIdx][1])) / 255.0;
+            colorsArr[x * 3 + 2] = (heatColors[cIdx][2] + frac * (heatColors[nextIdx][2] - heatColors[cIdx][2])) / 255.0;
+        }
+        
+        spectrumGeometry.attributes.position.needsUpdate = true;
+        spectrumGeometry.attributes.color.needsUpdate = true;
+
+        renderer.render(scene, camera);
+    }
+    
+    renderer.setAnimationLoop(animate);
+</script>
+</body>
+</html>
